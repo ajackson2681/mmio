@@ -1,0 +1,293 @@
+= Memory-Mapped I/O (MMIO)
+
+== Overview
+
+The `MMIO` library is header-only, wraps a fixed-width volatile type, and can be used for
+hardware memory-mapped layouts with a clean syntax. It supports whole-register reads and writes
+while also providing named access to individual bits and bit ranges.
+
+This library also includes a CMakeLists.txt to expose it as an interface for anyone who might be
+using CMake.
+
+== Implementation
+
+The MMIO implementation is split into two primary parts: `Register`, which is the actual wrapper
+around the fixed-width type, and `Field`, which is a metadata type used for defining the bitmask and
+shift to use when accessing a region within the `Register`. Each field descriptor also carries an
+`AccessPolicy` (`ReadWrite`, `ReadOnly`, or `WriteOnly`) so that misuse, such as writing a read-only
+field, or reading a write-only one, can be caught rather than silently doing the wrong thing.
+
+=== Register
+
+This is a class that wraps a fixed-width volatile datatype and overloads the subscript operators to
+allow the user to perform bit-level manipulation on them. This allows the programmer to read/write
+certain bits by accessing it with similar syntax to accessing an array index.
+
+[source,c++]
+----
+MMIO::Register<uint16_t> reg;
+reg[14] = 1; // sets bit 14 to 1
+----
+
+The `Register` wrapper achieves this sort of syntax by having a `const` and non-`const` version of
+each operator. The `const` operators simply return the value at the specified index or range as a
+type of the containing data. For instance, if it's a `MMIO::Register<uint32_t>` the const operators
+will return the value at the specified range as a `uint32_t`.
+
+The non-`const` operators return an internal proxy object which is non-const and modifiable. As a
+result, it allows the programmer to perform operations on the returned value. If we only had the
+`const` operators, actions like so:
+
+[source,c++]
+----
+MMIO::Register<uint32_t> reg;
+
+reg[3] = 1;
+----
+
+would not be possible.
+
+The wrapper additionally exposes all normally used bitwise compound-assignment operators:
+
+[source,c++]
+----
+MMIO::Register<uint8_t> reg = 0xFF;
+
+reg &= 0x02;
+// reg now equals 0x02
+
+reg |= 0x80;
+// reg now equals 0x82
+
+reg ^= 0xff;
+// reg now equals 0x7d
+----
+
+=== Field
+
+`Field` is a metadata type that describes an inclusive range of bits using a high and low bit, given
+as template parameters rather than constructor arguments, since the position is always known at
+compile time. It defaults `Low` to `High` so that you can just specify a single bit position if
+desired.
+
+[source,c++]
+----
+static constexpr MMIO::Field<7,4> Mode{};
+----
+
+The descriptor itself contains no register storage and performs no operations by itself. It is
+simply information to be passed to `Register` to identify a field as well as its access type. If no
+access type is specified, then it defaults to read/write.
+
+Field definitions _can_ be kept alongside the register they describe, and do not take up extra room
+within the struct as long as they are `static constexpr`. Using an RP2040 peripheral as an example:
+
+[source,c++]
+----
+struct BUSCTRL
+{
+    // Set the priority of each master for bus arbitration.
+    MMIO::Register<uint32_t> BUS_PRIORITY; // +0x0
+    struct BUS_PRIORITY_fields
+    {
+        // 0 - low priority, 1 - high priority
+        static constexpr MMIO::Field<12> DMA_W{};
+        // 0 - low priority, 1 - high priority
+        static constexpr MMIO::Field<8> DMA_R{};
+        // 0 - low priority, 1 - high priority
+        static constexpr MMIO::Field<4> PROC1{};
+        // 0 - low priority, 1 - high priority
+        static constexpr MMIO::Field<0> PROC0{};
+    };
+
+    // ... other registers
+
+    static constexpr uintptr_t BaseAddr = 0x40030000;
+};
+----
+
+This is useful because it keeps the field names and hardware positions in one place. However, this
+is not strictly necessary, and a descriptor can be constructed inline, without a named constant:
+
+[source,c++]
+----
+reg[MMIO::Field<7,4>{}] = value;
+----
+
+Note that the compound assignment operators mentioned above in `Register` section also work here on
+the field-level:
+
+[source,c++]
+----
+MMIO::Register<uint8_t> reg = 0xFF;
+static constexpr MMIO::Field<4,3> mid{};
+
+reg[mid] &= 0b00;
+// reg now equals 0xE7 (clears middle two bits)
+
+reg[mid] |= 0b10;
+// reg now equals 0xF7, (sets low bit of high nibble)
+
+reg[mid] ^= 0b11;
+// reg now equals 0xEF
+----
+
+== Access Semantics and Limitations
+
+=== Read-modify-write behavior
+
+Field writes on a `ReadWrite`-policy field are read-modify-write operations: the register is read,
+the field's bits are merged in, and the result is written back. `WriteOnly`-policy fields skip the
+read entirely; only the field's own bits are written, with the rest of the register set to zero.
+
+Read-modify-write is not safe to use blindly on registers with hardware semantics that
+`AccessPolicy` doesn't model. For those, use a register-specific method or a whole-register write
+that matches the hardware specification.
+
+=== No built-in synchronization
+
+This wrapper does not handle synchronization/atomicity. If that behavior is necessary, then it
+should be handled at the application level.
+
+=== Runtime-selected bits
+
+`MMIO` is most useful for fixed fields defined by the hardware map. Operations involving a range of
+runtime-selected bits can only be done with manual bit-shifting because `Field`'s template
+parameters must be known at compile time:
+
+[source,c++]
+----
+uint8_t low = pin * 2;
+uint8_t high = low + 1;
+
+port->MODER[MMIO::Field<high,low>{}] = mode; // NOT ALLOWED; high/low not known at compile time
+
+port->MODER = (port->MODER & ~(0b11u << low)) | ((mode & 0b11u) << low);
+----
+
+A single runtime-selected bit works fine using `reg[index]`.
+
+=== Validation
+
+Several types of validation are done at the field and bit levels:
+
+==== Field
+
+- `highBit >= lowBit` is enforced at compile time
+- `highBit` < 64 is enforced at compile time
+    - Standard integer types only go up to 64 bits, so high bit must be below this
+- `highBit` < sizeof(T) * 8 is enforced at compile time
+    - Register-level when fields are used
+    - Additional check beyond the field check that ensures that your high-end bit doesn't go out of
+    range
+- Access policy violations enforced at runtime (read to write-only, write to read-only, or compound
+  assignment on non-read/write field)
+    - Sets an error number and either throws an exception (if enabled) or no-ops
+
+==== Bit
+
+- `bitPos` < sizeof(T) * 8 is enforced at run time
+    - Done when fields are not used
+    - Sets an error number and either throws an exception (if enabled) or no-ops
+
+== Code Generation
+
+Hand-writing a register overlay is very impractical outside of small one-off definitions. Because of
+this, I have included a code generation script that accepts a CMSIS-SVD file and generates the
+respective header for you.
+
+It parses the SVD file and structures it like so:
+
+[source, c++]
+----
+struct PERIPHERAL_NAME
+{
+    static constexpr uintptr_t BaseAddr = PERIPH_BASE_ADDR_HEX;
+
+    MMIO::Register<REG_TYPE> REG_NAME;
+    struct REG_NAME_fields
+    {
+        static constexpr MMIO::Field<FIELD_HIGH_BIT, FIELD_LOW_BIT> FIELD_NAME{FIELD_ACCESS_POLICY};
+    };
+
+    // .. other registers/fields
+};
+----
+
+The `BaseAddr` member can be used directly in bare-metal:
+
+[source,c++]
+----
+PERIPHERAL_NAME* ptr = reinterpret_cast<PERIPHERAL_NAME*>(PERIPHERAL_NAME::BaseAddr);
+----
+
+or, on Linux, mapped through `/dev/mem`. `mmap` requires a page-aligned offset, so map the page
+containing `BaseAddr` and add the remainder to the returned pointer:
+
+[source,c++]
+----
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+int fd = open("/dev/mem", O_RDWR | O_SYNC);
+
+const uintptr_t pageSize = sysconf(_SC_PAGESIZE);
+const uintptr_t pageBase = PERIPHERAL_NAME::BaseAddr & ~(pageSize - 1);
+const uintptr_t pageOffset = PERIPHERAL_NAME::BaseAddr - pageBase;
+
+void* map = mmap(nullptr, pageOffset + sizeof(PERIPHERAL_NAME), PROT_READ | PROT_WRITE,
+                 MAP_SHARED, fd, pageBase);
+
+PERIPHERAL_NAME* ptr = reinterpret_cast<PERIPHERAL_NAME*>(static_cast<uint8_t*>(map) + pageOffset);
+----
+
+It will insert padding between registers as needed and formatted as
+`uint8_t _pad_0x<prev_offset>[num_bytes_to_next_offset];`, so for example:
+
+[source, c++]
+----
+struct Periph
+{
+    static constexpr uintptr_t BaseAddr = 0x12345678;
+
+    MMIO::Register<uint32_t> Reg1; // offset 0x00
+
+    MMIO::Register<uint32_t> Reg2; // offset 0x04
+
+    uint8_t _pad_0x04[0x78]; // offset 0x08, 0x08 + 0x78 = 0x80
+
+    MMIO::Register<uint32_t> Reg3; // offset 0x80
+};
+----
+
+To use the code generator, it's recommended to install a python virtual environment, since this
+script relies on the cmsis-svd package, which isn't available in the apt repositories (and modern
+debian/ubuntu distros don't allow installing pip packages globally).
+
+[source, bash]
+----
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+----
+
+Then you can just run the script:
+
+[source, bash]
+----
+python codegen/genheader.py <svd input>
+----
+
+and it will spit out the header as the same name as the input, just with a `.hpp` extension.
+
+I have tested this against all the svds listed in the
+https://github.com/cmsis-svd/cmsis-svd-data[CMSIS-SVD Repo] (which is 872 files), and they all
+compile cleanly.
+
+If there are register overlaps (this sometimes happens when the vendor doesn't specify the register
+size), the code generator will warn you and write the entry commented out in the header file.
+You can also run the code generator with the `-s` flag to attempt to automatically resize the
+earlier register to fit. Without `-s`, nothing reserves the space the commented-out register would
+have occupied, so every register after it in that peripheral may also end up at the wrong offset
+until it's fixed.

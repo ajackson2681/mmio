@@ -1,0 +1,389 @@
+/**
+ * @file MMIO.hpp
+ * @author Adam Jackson (contact@adamjackson.dev)
+ *
+ * @brief Header-only wrapper around fixed-width volatile types for memory-mapped hardware
+ * registers. `Register<T>` wraps the raw storage; `Field<High, Low = High>` is a compile-time
+ * descriptor for a bit range within it (or a single bit, via the defaulted `Low`), used as a
+ * subscript.
+ *
+ * ```
+ * struct SomeRegisterMap {
+ *     MMIO::Register<uint32_t> control; // offset 0x00
+ *     MMIO::Register<uint32_t> status;  // offset 0x04
+ * };
+ *
+ * SomeRegisterMap* regs = reinterpret_cast<SomeRegisterMap*>(0x40000000);
+ *
+ * regs->control = 0x01;                            // whole-register write
+ * uint32_t status = regs->status;                  // whole-register read
+ * regs->control[MMIO::Field<7,0>{}] = 0xFF;         // field write
+ *
+ * static constexpr MMIO::Field<3> Enable{};                                // ReadWrite (default)
+ * static constexpr MMIO::Field<4> Busy{MMIO::AccessPolicy::ReadOnly};      // access-checked
+ * ```
+ *
+ * Field access is checked against its `AccessPolicy`; misuse that's knowable at compile time
+ * (a field that doesn't fit the register's width) fails via `static_assert`, and misuse only
+ * knowable at runtime (writing a read-only field, an out-of-range bit position, etc.) sets
+ * `MMIO::errnum` and throws when exceptions are enabled.
+ *
+ * See README.adoc for the full rationale, padding conventions, and code generation via
+ * `genheader.py`.
+ *
+ * @version 1.0
+ * @date 2026-10-05
+ *
+ * @copyright Copyright (c) 2026
+ *
+ */
+#pragma once
+
+#include <cstdint>
+#include <type_traits>
+
+#ifdef __EXCEPTIONS
+#include <stdexcept>
+#endif
+
+namespace MMIO
+{
+
+enum Error
+{
+    None,
+    WriteToReadOnly,
+    ReadFromWriteOnly,
+    CompoundAssignOnNonReadWrite,
+    BadBitPosition,
+};
+
+inline Error errnum = Error::None;
+
+/**
+ * Reports an MMIO error by setting `errnum` and, if exceptions are enabled,
+ * throwing a corresponding standard exception. When exceptions are disabled
+ * the call is a no-op beyond updating `errnum`; callers should check it
+ * afterward when error detection is required.
+ */
+inline void reportError(Error error)
+{
+    errnum = error;
+
+#ifdef __EXCEPTIONS
+    switch (error) {
+        case WriteToReadOnly:
+            throw std::logic_error("MMIO: write to read-only field");
+        case ReadFromWriteOnly:
+            throw std::logic_error("MMIO: read from write-only field");
+        case CompoundAssignOnNonReadWrite:
+            throw std::logic_error("MMIO: compound assignment on non-read-write field");
+        case BadBitPosition:
+            throw std::out_of_range("MMIO: bit position out of range");
+        default:
+            break;
+    }
+#endif
+}
+
+template <typename T>
+static T GenMask(uint8_t highBit, uint8_t lowBit)
+{
+    T mask = (highBit - lowBit + 1 == sizeof(T) * 8) ?
+                static_cast<T>(~static_cast<T>(0)) :
+                ((static_cast<T>(1) << (highBit - lowBit + 1)) - 1) << lowBit;
+
+    return mask;
+}
+
+/**
+ * Follows SVD's access types. The only one that is omitted is ReadWriteOnce, since that's
+ * not really easy to do without some complicated metadata. So just make sure to be careful
+ * of that
+ */
+enum AccessPolicy
+{
+    ReadWrite,
+    ReadOnly,
+    WriteOnly,
+};
+
+template <uint8_t High, uint8_t Low = High>
+struct Field
+{
+    static_assert(High >= Low, "High must be >= Low");
+    static_assert(High < 64, "High bit out of range");
+
+    constexpr Field(AccessPolicy policy = AccessPolicy::ReadWrite)
+        : accessPolicy(policy)
+        , highBit(High)
+        , lowBit(Low) {}
+
+    const AccessPolicy accessPolicy = AccessPolicy::ReadWrite;
+
+    const uint8_t highBit = High;
+    const uint8_t lowBit = Low;
+};
+
+template <typename T, bool IsVolatile = true>
+class Register
+{
+    class RegisterProxy;
+
+public:
+    Register()
+        : raw(0)
+    {}
+
+    Register(T initial)
+        : raw(initial)
+    {}
+
+    // purposefully deleted
+    Register(const Register&)            = delete;
+    Register& operator=(const Register&) = delete;
+
+    Register& operator=(T value)
+    {
+        raw = value;
+        return *this;
+    }
+
+    Register& operator&=(T mask)
+    {
+        T snapshot = raw;
+        snapshot &= mask;
+        raw = snapshot;
+        return *this;
+    }
+
+    Register& operator|=(T mask)
+    {
+        T snapshot = raw;
+        snapshot |= mask;
+        raw = snapshot;
+        return *this;
+    }
+
+    Register& operator^=(T mask)
+    {
+        T snapshot = raw;
+        snapshot ^= mask;
+        raw = snapshot;
+        return *this;
+    }
+
+    operator T() const
+    {
+        return raw;
+    }
+
+    Register& operator<<=(int shiftAmount)
+    {
+        T snapshot = raw;
+        snapshot <<= shiftAmount;
+        raw = snapshot;
+        return *this;
+    }
+
+    Register& operator>>=(int shiftAmount)
+    {
+        T snapshot = raw;
+        snapshot >>= shiftAmount;
+        raw = snapshot;
+        return *this;
+    }
+
+    T operator<<(int shiftAmount) const
+    {
+        return static_cast<T>(raw) << shiftAmount;
+    }
+
+    T operator>>(int shiftAmount) const
+    {
+        return static_cast<T>(raw) >> shiftAmount;
+    }
+
+    // Single bit read
+    T operator[](uint8_t bitPosition) const
+    {
+        if (bitPosition >= sizeof(T) * 8) {
+            reportError(Error::BadBitPosition);
+            return static_cast<T>(0);
+        }
+
+        return GetBits(bitPosition, bitPosition);
+    }
+
+    // Single bit read/write
+    RegisterProxy operator[](const uint8_t bitPosition)
+    {
+        if (bitPosition >= sizeof(T) * 8) {
+            reportError(Error::BadBitPosition);
+        }
+
+        return RegisterProxy(*this, bitPosition, bitPosition, AccessPolicy::ReadWrite);
+    }
+
+    // Field range read
+    template<uint8_t High, uint8_t Low>
+    T operator[](const Field<High, Low>& spec) const
+    {
+        static_assert(High < sizeof(T) * 8, "High bit is outside of maximum range");
+
+        if (spec.accessPolicy == AccessPolicy::WriteOnly) {
+            reportError(Error::ReadFromWriteOnly);
+            return static_cast<T>(0);
+        }
+
+        return GetBits(spec.highBit, spec.lowBit);
+    }
+
+    // Field range read/write
+    template<uint8_t High, uint8_t Low>
+    RegisterProxy operator[](const Field<High, Low>& spec)
+    {
+        static_assert(High < sizeof(T) * 8, "High bit is outside of maximum range");
+
+        return RegisterProxy(*this, spec.highBit, spec.lowBit, spec.accessPolicy);
+    }
+
+private:
+    using Storage = std::conditional_t<IsVolatile, volatile T, T>;
+    Storage raw;
+
+    class RegisterProxy
+    {
+    public:
+        RegisterProxy(Register& field_, uint8_t highBit_, uint8_t lowBit_, AccessPolicy access_)
+            : field(field_)
+            , highBit(highBit_)
+            , lowBit(lowBit_)
+            , accessPolicy(access_)
+        {}
+
+        RegisterProxy(const RegisterProxy&) = delete;
+
+        operator T() const
+        {
+            if (accessPolicy == AccessPolicy::WriteOnly) {
+                reportError(Error::ReadFromWriteOnly);
+                return 0;
+            }
+
+            return field.GetBits(highBit, lowBit);
+        }
+
+        RegisterProxy& operator=(T value)
+        {
+            if (accessPolicy == AccessPolicy::ReadOnly) {
+                reportError(Error::WriteToReadOnly);
+                return *this;
+            }
+
+            if (accessPolicy == AccessPolicy::ReadWrite) {
+                field.SetBits(highBit, lowBit, value);
+            }
+            else {
+                // Write-only fields cannot safely perform a read-modify-write since the
+                // read may return undefined or stale data. Instead, only the field bits
+                // are written and all other bits in the register are set to zero.
+                // If this is not the desired behavior, use a whole-register write directly.
+                field.SetBitsNoRead(highBit, lowBit, value);
+            }
+
+            return *this;
+        }
+
+        RegisterProxy& operator|=(T mask)
+        {
+            if (accessPolicy != AccessPolicy::ReadWrite) {
+                reportError(Error::CompoundAssignOnNonReadWrite);
+                return *this;
+            }
+
+            T snapshot = field.GetBits(highBit, lowBit);
+            snapshot |= mask;
+            field.SetBits(highBit, lowBit, snapshot);
+            return *this;
+        }
+
+        RegisterProxy& operator&=(T mask)
+        {
+            if (accessPolicy != AccessPolicy::ReadWrite) {
+                reportError(Error::CompoundAssignOnNonReadWrite);
+                return *this;
+            }
+
+            T snapshot = field.GetBits(highBit, lowBit);
+            snapshot &= mask;
+            field.SetBits(highBit, lowBit, snapshot);
+            return *this;
+        }
+
+        RegisterProxy& operator^=(T mask)
+        {
+            if (accessPolicy != AccessPolicy::ReadWrite) {
+                reportError(Error::CompoundAssignOnNonReadWrite);
+                return *this;
+            }
+
+            T snapshot = field.GetBits(highBit, lowBit);
+            snapshot ^= mask;
+            field.SetBits(highBit, lowBit, snapshot);
+            return *this;
+        }
+
+    private:
+        Register& field;
+        uint8_t highBit;
+        uint8_t lowBit;
+        AccessPolicy accessPolicy;
+    };
+
+    void SetBits(uint8_t highBit, uint8_t lowBit, T value)
+    {
+        if (highBit >= sizeof(T) * 8) {
+            reportError(Error::BadBitPosition);
+            return;
+        }
+
+        T snapshot = raw;
+        T mask = MMIO::GenMask<T>(highBit, lowBit);
+        raw = (snapshot & ~mask) | ((value << lowBit) & mask);
+    }
+
+    void SetBitsNoRead(uint8_t highBit, uint8_t lowBit, T value)
+    {
+        if (highBit >= sizeof(T) * 8) {
+            reportError(Error::BadBitPosition);
+            return;
+        }
+
+        raw = (value << lowBit) & MMIO::GenMask<T>(highBit, lowBit);
+    }
+
+    T GetBits(uint8_t highBit, uint8_t lowBit) const
+    {
+        if (highBit >= sizeof(T) * 8) {
+            reportError(Error::BadBitPosition);
+            return 0;
+        }
+
+        T snapshot = raw;
+        T mask = MMIO::GenMask<T>(highBit, lowBit);
+        return (snapshot & mask) >> lowBit;
+    }
+
+    static_assert(std::is_unsigned_v<T>, "Register<T> requires an unsigned type");
+};
+
+static_assert(sizeof(Register<uint32_t>) == sizeof(uint32_t), "Register<uint32_t> size mismatch");
+static_assert(std::is_standard_layout_v<Register<uint32_t>>, "Register<uint32_t> is not standard layout");
+
+static_assert(sizeof(Register<uint32_t, false>) == sizeof(uint32_t), "Register<uint32_t, false> size mismatch");
+static_assert(std::is_standard_layout_v<Register<uint32_t, false>>, "Register<uint32_t, false> is not standard layout");
+
+template <typename T>
+using BitField = Register<T, false>;
+};
