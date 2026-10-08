@@ -31,7 +31,7 @@
  * See README.adoc for the full rationale, padding conventions, and code generation via
  * `genheader.py`.
  *
- * @version 1.0
+ * @version 1.1
  * @date 2026-10-05
  *
  * @copyright Copyright (c) 2026
@@ -39,15 +39,30 @@
  */
 #pragma once
 
-#include <cstdint>
-#include <type_traits>
+#include <stdint.h>
 
+
+// double check to verify exceptions are enabled AND we actually have the header to include
 #ifdef __EXCEPTIONS
+#if __has_include(<stdexcept>)
+
+#define MMIO_USE_EXCEPTIONS
 #include <stdexcept>
+
+#endif
 #endif
 
 namespace MMIO
 {
+    // used for conditionally selecting voltaile data type without the need for
+    // type_traits
+    namespace detail {
+        template <typename T, bool IsVolatile>
+        struct Storage { using type = volatile T; };
+
+        template <typename T>
+        struct Storage<T, false> { using type = T; };
+    }
 
 enum Error
 {
@@ -70,7 +85,7 @@ inline void reportError(Error error)
 {
     errnum = error;
 
-#ifdef __EXCEPTIONS
+#ifdef MMIO_USE_EXCEPTIONS
     switch (error) {
         case WriteToReadOnly:
             throw std::logic_error("MMIO: write to read-only field");
@@ -248,8 +263,32 @@ public:
         return RegisterProxy(*this, spec.highBit, spec.lowBit, spec.accessPolicy);
     }
 
+    void SetBits(uint8_t highBit, uint8_t lowBit, T value)
+    {
+        if (highBit >= sizeof(T) * 8) {
+            reportError(Error::BadBitPosition);
+            return;
+        }
+
+        T snapshot = raw;
+        T mask = MMIO::GenMask<T>(highBit, lowBit);
+        raw = (snapshot & ~mask) | ((value << lowBit) & mask);
+    }
+
+    T GetBits(uint8_t highBit, uint8_t lowBit) const
+    {
+        if (highBit >= sizeof(T) * 8) {
+            reportError(Error::BadBitPosition);
+            return 0;
+        }
+
+        T snapshot = raw;
+        T mask = MMIO::GenMask<T>(highBit, lowBit);
+        return (snapshot & mask) >> lowBit;
+    }
+
 private:
-    using Storage = std::conditional_t<IsVolatile, volatile T, T>;
+    using Storage = typename detail::Storage<T, IsVolatile>::type;
     Storage raw;
 
     class RegisterProxy
@@ -341,18 +380,6 @@ private:
         AccessPolicy accessPolicy;
     };
 
-    void SetBits(uint8_t highBit, uint8_t lowBit, T value)
-    {
-        if (highBit >= sizeof(T) * 8) {
-            reportError(Error::BadBitPosition);
-            return;
-        }
-
-        T snapshot = raw;
-        T mask = MMIO::GenMask<T>(highBit, lowBit);
-        raw = (snapshot & ~mask) | ((value << lowBit) & mask);
-    }
-
     void SetBitsNoRead(uint8_t highBit, uint8_t lowBit, T value)
     {
         if (highBit >= sizeof(T) * 8) {
@@ -363,27 +390,17 @@ private:
         raw = (value << lowBit) & MMIO::GenMask<T>(highBit, lowBit);
     }
 
-    T GetBits(uint8_t highBit, uint8_t lowBit) const
-    {
-        if (highBit >= sizeof(T) * 8) {
-            reportError(Error::BadBitPosition);
-            return 0;
-        }
-
-        T snapshot = raw;
-        T mask = MMIO::GenMask<T>(highBit, lowBit);
-        return (snapshot & mask) >> lowBit;
-    }
-
-    static_assert(std::is_unsigned_v<T>, "Register<T> requires an unsigned type");
+    static_assert((T)-1 > 0, "Register<T> requires an unsigned type");
 };
 
 static_assert(sizeof(Register<uint32_t>) == sizeof(uint32_t), "Register<uint32_t> size mismatch");
-static_assert(std::is_standard_layout_v<Register<uint32_t>>, "Register<uint32_t> is not standard layout");
+static_assert(__is_standard_layout(Register<uint32_t>), "Register<uint32_t, false> is not standard layout");
 
 static_assert(sizeof(Register<uint32_t, false>) == sizeof(uint32_t), "Register<uint32_t, false> size mismatch");
-static_assert(std::is_standard_layout_v<Register<uint32_t, false>>, "Register<uint32_t, false> is not standard layout");
+static_assert(__is_standard_layout(Register<uint32_t, false>), "Register<uint32_t, false> is not standard layout");
 
+// alias for Register which defines it as non-volatile type. Useful for more general-purpose
+// operations
 template <typename T>
 using BitField = Register<T, false>;
 };

@@ -86,6 +86,8 @@ within the struct as long as they are `static constexpr`. Using an RP2040 periph
 ----
 struct BUSCTRL
 {
+    static constexpr uintptr_t BaseAddr = 0x40030000;
+
     // Set the priority of each master for bus arbitration.
     MMIO::Register<uint32_t> BUS_PRIORITY; // +0x0
     struct BUS_PRIORITY_fields
@@ -101,8 +103,6 @@ struct BUSCTRL
     };
 
     // ... other registers
-
-    static constexpr uintptr_t BaseAddr = 0x40030000;
 };
 ----
 
@@ -152,8 +152,9 @@ should be handled at the application level.
 === Runtime-selected bits
 
 `MMIO` is most useful for fixed fields defined by the hardware map. Operations involving a range of
-runtime-selected bits can only be done with manual bit-shifting because `Field`'s template
-parameters must be known at compile time:
+runtime-selected bits cannot be done with a field because `Field`'s template parameters must be
+known at compile time, however, you can achieve this behavior by using `GetBits` or `SetBits`
+directly. Note that this will not perform any access policy checking.
 
 [source,c++]
 ----
@@ -162,10 +163,15 @@ uint8_t high = low + 1;
 
 port->MODER[MMIO::Field<high,low>{}] = mode; // NOT ALLOWED; high/low not known at compile time
 
-port->MODER = (port->MODER & ~(0b11u << low)) | ((mode & 0b11u) << low);
+port->MODER.SetBits(high, low, mode); // ALLOWED, and will do the necessary shifting
 ----
 
 A single runtime-selected bit works fine using `reg[index]`.
+
+=== Unsigned Integer
+
+This library is unsigned-integer-only by design. To use it as a bit field over a signed or
+floating-point value, memcpy the value's bytes into/out of a same-sized unsigned BitField.
 
 === Validation
 
@@ -173,22 +179,22 @@ Several types of validation are done at the field and bit levels:
 
 ==== Field
 
-- `highBit >= lowBit` is enforced at compile time
-- `highBit` < 64 is enforced at compile time
-    - Standard integer types only go up to 64 bits, so high bit must be below this
-- `highBit` < sizeof(T) * 8 is enforced at compile time
-    - Register-level when fields are used
-    - Additional check beyond the field check that ensures that your high-end bit doesn't go out of
+* `highBit >= lowBit` is enforced at compile time
+* `highBit` < 64 is enforced at compile time
+    ** Standard integer types only go up to 64 bits, so high bit must be below this
+* `highBit` < sizeof(T) * 8 is enforced at compile time
+    ** Register-level when fields are used
+    ** Additional check beyond the field check that ensures that your high-end bit doesn't go out of
     range
-- Access policy violations enforced at runtime (read to write-only, write to read-only, or compound
+* Access policy violations enforced at runtime (read to write-only, write to read-only, or compound
   assignment on non-read/write field)
-    - Sets an error number and either throws an exception (if enabled) or no-ops
+    ** Sets an error number and either throws an exception (if enabled) or no-ops
 
 ==== Bit
 
-- `bitPos` < sizeof(T) * 8 is enforced at run time
-    - Done when fields are not used
-    - Sets an error number and either throws an exception (if enabled) or no-ops
+* `bitPos` < sizeof(T) * 8 is enforced at run time
+    ** Done when fields are not used
+    ** Sets an error number and either throws an exception (if enabled) or no-ops
 
 == Code Generation
 
