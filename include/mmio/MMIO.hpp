@@ -41,15 +41,23 @@
 
 #include <stdint.h>
 
-
-// double check to verify exceptions are enabled AND we actually have the header to include
-#ifdef __EXCEPTIONS
-#if __has_include(<stdexcept>)
-
-#define MMIO_USE_EXCEPTIONS
-#include <stdexcept>
-
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+    #if defined(__has_include)
+        #if __has_include(<stdexcept>)
+            #define MMIO_DETAIL_EXCEPTIONS
+            #include <stdexcept>
+        #endif
+    #endif
 #endif
+
+#if defined(__GNUC__) || defined(__clang__)
+  #define MMIO_ALWAYS_INLINE [[gnu::always_inline]] inline
+#elif defined(_MSC_VER)
+  #define MMIO_ALWAYS_INLINE __forceinline
+#elif defined(__IAR_SYSTEMS_ICC__)
+  #define MMIO_ALWAYS_INLINE _Pragma("inline=forced") inline
+#else
+  #define MMIO_ALWAYS_INLINE inline
 #endif
 
 namespace MMIO
@@ -116,26 +124,20 @@ static T GenMask(uint8_t highBit, uint8_t lowBit)
  * not really easy to do without some complicated metadata. So just make sure to be careful
  * of that
  */
-enum AccessPolicy
+enum Access
 {
     ReadWrite,
     ReadOnly,
     WriteOnly,
 };
 
-template <uint8_t High, uint8_t Low = High>
+template <Access Policy, uint8_t High, uint8_t Low = High>
 struct Field
 {
     static_assert(High >= Low, "High must be >= Low");
     static_assert(High < 64, "High bit out of range");
 
-    constexpr Field(AccessPolicy policy = AccessPolicy::ReadWrite)
-        : accessPolicy(policy)
-        , highBit(High)
-        , lowBit(Low) {}
-
-    const AccessPolicy accessPolicy = AccessPolicy::ReadWrite;
-
+    const Access accessPolicy = Policy;
     const uint8_t highBit = High;
     const uint8_t lowBit = Low;
 };
@@ -143,6 +145,7 @@ struct Field
 template <typename T, bool IsVolatile = true>
 class Register
 {
+    template <Access Policy>
     class RegisterProxy;
 
 public:
@@ -231,36 +234,32 @@ public:
     }
 
     // Single bit read/write
-    RegisterProxy operator[](const uint8_t bitPosition)
+    RegisterProxy<Access::ReadWrite> operator[](const uint8_t bitPosition)
     {
         if (bitPosition >= sizeof(T) * 8) {
             reportError(Error::BadBitPosition);
         }
 
-        return RegisterProxy(*this, bitPosition, bitPosition, AccessPolicy::ReadWrite);
+        return RegisterProxy<Access::ReadWrite>(*this, bitPosition, bitPosition);
     }
 
     // Field range read
-    template<uint8_t High, uint8_t Low>
-    T operator[](const Field<High, Low>& spec) const
+    template<Access Policy, uint8_t High, uint8_t Low>
+    T operator[](const Field<Policy, High, Low>& spec) const
     {
+        static_assert(Policy != Access::WriteOnly, "Cannot read from a write-only field");
         static_assert(High < sizeof(T) * 8, "High bit is outside of maximum range");
 
-        if (spec.accessPolicy == AccessPolicy::WriteOnly) {
-            reportError(Error::ReadFromWriteOnly);
-            return static_cast<T>(0);
-        }
-
-        return GetBits(spec.highBit, spec.lowBit);
+        return GetBits(High, Low);
     }
 
     // Field range read/write
-    template<uint8_t High, uint8_t Low>
-    RegisterProxy operator[](const Field<High, Low>& spec)
+    template<Access Policy, uint8_t High, uint8_t Low>
+    RegisterProxy<Policy> operator[](const Field<Policy, High, Low>& spec)
     {
         static_assert(High < sizeof(T) * 8, "High bit is outside of maximum range");
 
-        return RegisterProxy(*this, spec.highBit, spec.lowBit, spec.accessPolicy);
+        return RegisterProxy<Policy>(*this, High, Low);
     }
 
     void SetBits(uint8_t highBit, uint8_t lowBit, T value)
@@ -287,40 +286,40 @@ public:
         return (snapshot & mask) >> lowBit;
     }
 
+    T Value() const
+    {
+        return raw;
+    }
+
 private:
     using Storage = typename detail::Storage<T, IsVolatile>::type;
     Storage raw;
 
+    template <Access Policy>
     class RegisterProxy
     {
     public:
-        RegisterProxy(Register& field_, uint8_t highBit_, uint8_t lowBit_, AccessPolicy access_)
+        RegisterProxy(Register& field_, uint8_t highBit_, uint8_t lowBit_)
             : field(field_)
             , highBit(highBit_)
             , lowBit(lowBit_)
-            , accessPolicy(access_)
         {}
 
         RegisterProxy(const RegisterProxy&) = delete;
 
         operator T() const
         {
-            if (accessPolicy == AccessPolicy::WriteOnly) {
-                reportError(Error::ReadFromWriteOnly);
-                return 0;
-            }
+            static_assert(Policy != Access::WriteOnly, "Cannot read from a write-only field");
 
             return field.GetBits(highBit, lowBit);
         }
 
+        MMIO_ALWAYS_INLINE
         RegisterProxy& operator=(T value)
         {
-            if (accessPolicy == AccessPolicy::ReadOnly) {
-                reportError(Error::WriteToReadOnly);
-                return *this;
-            }
+            static_assert(Policy != Access::ReadOnly, "Cannot write to a read-only field");
 
-            if (accessPolicy == AccessPolicy::ReadWrite) {
+            if constexpr (Policy == Access::ReadWrite) {
                 field.SetBits(highBit, lowBit, value);
             }
             else {
@@ -336,10 +335,8 @@ private:
 
         RegisterProxy& operator|=(T mask)
         {
-            if (accessPolicy != AccessPolicy::ReadWrite) {
-                reportError(Error::CompoundAssignOnNonReadWrite);
-                return *this;
-            }
+            static_assert(Policy == Access::ReadWrite,
+                          "Compound assignment requires a read-write field");
 
             T snapshot = field.GetBits(highBit, lowBit);
             snapshot |= mask;
@@ -349,10 +346,8 @@ private:
 
         RegisterProxy& operator&=(T mask)
         {
-            if (accessPolicy != AccessPolicy::ReadWrite) {
-                reportError(Error::CompoundAssignOnNonReadWrite);
-                return *this;
-            }
+            static_assert(Policy == Access::ReadWrite,
+                          "Compound assignment requires a read-write field");
 
             T snapshot = field.GetBits(highBit, lowBit);
             snapshot &= mask;
@@ -362,10 +357,8 @@ private:
 
         RegisterProxy& operator^=(T mask)
         {
-            if (accessPolicy != AccessPolicy::ReadWrite) {
-                reportError(Error::CompoundAssignOnNonReadWrite);
-                return *this;
-            }
+            static_assert(Policy == Access::ReadWrite,
+                          "Compound assignment requires a read-write field");
 
             T snapshot = field.GetBits(highBit, lowBit);
             snapshot ^= mask;
@@ -377,7 +370,6 @@ private:
         Register& field;
         uint8_t highBit;
         uint8_t lowBit;
-        AccessPolicy accessPolicy;
     };
 
     void SetBitsNoRead(uint8_t highBit, uint8_t lowBit, T value)
