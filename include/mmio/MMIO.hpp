@@ -110,7 +110,7 @@ inline void reportError(Error error)
 }
 
 template <typename T>
-static T GenMask(uint8_t highBit, uint8_t lowBit)
+constexpr T GenMask(uint8_t highBit, uint8_t lowBit)
 {
     T mask = (highBit - lowBit + 1 == sizeof(T) * 8) ?
                 static_cast<T>(~static_cast<T>(0)) :

@@ -88,15 +88,15 @@ def int_type(bit_size):
 
 def access_policy(access):
     match access:
-        case SVDAccessType.READ_WRITE: return "{}"
-        case SVDAccessType.READ_ONLY: return "{MMIO::AccessPolicy::ReadOnly}"
-        case SVDAccessType.WRITE_ONLY: return "{MMIO::AccessPolicy::WriteOnly}"
-        case SVDAccessType.WRITE_ONCE: return "{MMIO::AccessPolicy::WriteOnly}"
+        case SVDAccessType.READ_WRITE: return "MMIO::Access::ReadWrite"
+        case SVDAccessType.READ_ONLY: return "MMIO::Access::ReadOnly"
+        case SVDAccessType.WRITE_ONLY: return "MMIO::Access::WriteOnly"
+        case SVDAccessType.WRITE_ONCE: return "MMIO::Access::WriteOnly"
         # there's not a good, reliable, way to enforce this at the programatic level
         # so instead, we just explicitly name it "ReadWrite" in the generated header
         # _actual_ read/write registers in the header won't have an access policy
         # specified (default _is_ true read/write)
-        case SVDAccessType.READ_WRITE_ONCE: return "{MMIO::AccessPolicy::ReadWrite}"
+        case SVDAccessType.READ_WRITE_ONCE: return "{MMIO::Access::ReadWrite}"
         # just return to default if somehow the access policy is invalid
         case _: return "{}"
 
@@ -234,14 +234,14 @@ def parse_fields(variantname: str, fields: list[SVDField], il=8):
             # a little more clear for someone glancing at the generated header.
             pos = field.bit_offset
             lines.append(desc(field.description, il))
-            lines.append(idt(il) + f"static constexpr MMIO::Field<{pos}> "\
-                         f"{name}{ap};")
+            lines.append(idt(il) + f"static constexpr MMIO::Field<{ap}, {pos}> "\
+                         f"{name}{{}};")
         else:
             high = field.bit_offset + field.bit_width - 1
             low = field.bit_offset
             lines.append(desc(field.description, il))
-            lines.append(idt(il) + f"static constexpr MMIO::Field<{high}, {low}> "\
-                         f"{name}{ap};")
+            lines.append(idt(il) + f"static constexpr MMIO::Field<{ap}, {high}, {low}> "\
+                         f"{name}{{}};")
 
     return "\n".join(lines)
 
@@ -301,7 +301,7 @@ def parse_register(register: RegItem, assert_info):
                     lines.append(idt(8) + "};")
             else:
                 ap = access_policy(variant.reg.access)
-                lines.append(idt(8) + f"static constexpr MMIO::Field<{size - 1}, 0> {variant.name}{ap};")
+                lines.append(idt(8) + f"static constexpr MMIO::Field<ap, {size - 1}, 0> {variant.name}{{}};")
 
         lines.append(idt(4) + "};")
     else:
